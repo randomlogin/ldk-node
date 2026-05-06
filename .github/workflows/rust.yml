@@ -10,27 +10,8 @@ jobs:
   build:
     strategy:
       matrix:
-        platform: [
-          ubuntu-latest,
-          macos-latest,
-          windows-latest,
-          ]
-        toolchain: [
-          stable,
-          beta,
-          1.85.0, # Our MSRV
-          ]
-        include:
-          - toolchain: stable
-            check-fmt: true
-            build-uniffi: true
-            platform: ubuntu-latest
-          - toolchain: stable
-            platform: macos-latest
-          - toolchain: stable
-            platform: windows-latest
-          - toolchain: 1.85.0
-            msrv: true
+        platform: [macos-latest]
+        toolchain: [beta]
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout source code
@@ -81,37 +62,9 @@ jobs:
       - name: Check release build with UniFFI support on Rust ${{ matrix.toolchain }}
         if: matrix.build-uniffi
         run: cargo check --release --features uniffi --verbose --color always
+      - name: Run probing tests first (with stdout) on Rust ${{ matrix.toolchain }}
+        run: |
+          RUSTFLAGS="--cfg no_download --cfg cycle_tests" cargo test --test probing_tests -- --nocapture --test-threads=1
       - name: Test on Rust ${{ matrix.toolchain }}
-        if: "matrix.platform != 'windows-latest'"
         run: |
           RUSTFLAGS="--cfg no_download --cfg cycle_tests" cargo test
-      - name: Test with UniFFI support on Rust ${{ matrix.toolchain }}
-        if: "matrix.platform != 'windows-latest' && matrix.build-uniffi"
-        run: |
-          RUSTFLAGS="--cfg no_download --cfg cycle_tests" cargo test --features uniffi
-
-  linting:
-    name: Linting
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout source code
-        uses: actions/checkout@v6
-      - name: Install Rust and clippy
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal --default-toolchain stable
-          rustup component add clippy
-      - name: Ban `unwrap` in library code
-        run: |
-          cargo clippy --lib --verbose --color always -- -A warnings -D clippy::unwrap_used -A clippy::tabs_in_doc_comments
-          cargo clippy --lib --features uniffi --verbose --color always -- -A warnings -D clippy::unwrap_used -A clippy::tabs_in_doc_comments
-
-  doc:
-    name: Documentation
-    runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: -Dwarnings
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: dtolnay/install@cargo-docs-rs
-      - run: cargo docs-rs

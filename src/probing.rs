@@ -801,12 +801,26 @@ pub(crate) async fn run_prober(prober: Arc<Prober>, mut stop_rx: tokio::sync::wa
 				return;
 			}
 			_ = ticker.tick() => {
+				eprintln!("[prober-debug] tick");
 				let path = match prober.strategy.next_probe() {
 					Some(p) => p,
-					None => continue,
+					None => {
+						eprintln!("[prober-debug] next_probe() returned None — skipping tick");
+						continue;
+					}
 				};
 				let amount: u64 = path.hops.iter().map(|h| h.fee_msat).sum();
-				if prober.locked_msat.load(Ordering::Acquire) + amount > prober.max_locked_msat {
+				eprintln!(
+					"[prober-debug] candidate probe: amount={} path={}",
+					amount,
+					fmt_path(&path)
+				);
+				let current_locked = prober.locked_msat.load(Ordering::Acquire);
+				if current_locked + amount > prober.max_locked_msat {
+					eprintln!(
+						"[prober-debug] skipping: locked={} + amount={} > cap={}",
+						current_locked, amount, prober.max_locked_msat
+					);
 					log_debug!(prober.logger, "Skipping probe: locked-msat budget exceeded.");
 					continue;
 				}
@@ -820,6 +834,10 @@ pub(crate) async fn run_prober(prober: Arc<Prober>, mut stop_rx: tokio::sync::wa
 						inflight.insert(payment_id, amount);
 						prober.locked_msat.fetch_add(amount, Ordering::Release);
 						drop(inflight);
+						eprintln!(
+							"[prober-debug] send_probe OK: payment_id={:?} locked+={}",
+							payment_id, amount
+						);
 						log_debug!(
 							prober.logger,
 							"Probe sent: locked {} msat, path: {}",
@@ -829,6 +847,11 @@ pub(crate) async fn run_prober(prober: Arc<Prober>, mut stop_rx: tokio::sync::wa
 					}
 					Err(e) => {
 						drop(inflight);
+						eprintln!(
+							"[prober-debug] send_probe ERR: {:?} path={}",
+							e,
+							fmt_path(&path)
+						);
 						log_debug!(
 							prober.logger,
 							"Probe send failed: {:?}, path: {}",
