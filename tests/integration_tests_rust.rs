@@ -382,6 +382,11 @@ async fn start_stop_reinit() {
 async fn onchain_send_receive() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	// Relies on unconfirmed-tx visibility: `wait_for_tx` waits for electrsd's mempool,
+	// then `node.payment(...)` expects to observe a Pending / Unconfirmed payment. CBF
+	// has no mempool, so the lookup returns None until the tx is mined. The
+	// `onchain_send_receive_cbf` variant is the confirmation-aware equivalent.
+	skip_if_cbf!(chain_source);
 	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
 
 	let addr_a = node_a.onchain_payment().new_address().unwrap();
@@ -665,9 +670,11 @@ async fn onchain_send_all_retains_reserve() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn onchain_wallet_recovery() {
+
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	skip_if_cbf!(chain_source);
 
 	let original_config = random_config(true);
 	let original_node_entropy = original_config.node_entropy;

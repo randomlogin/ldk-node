@@ -270,7 +270,10 @@ impl ChainSource {
 			ChainSourceKind::Esplora(_) => true,
 			ChainSourceKind::Electrum { .. } => true,
 			ChainSourceKind::Bitcoind { .. } => false,
-			ChainSourceKind::Cbf { .. } => true,
+			// CBF drives both wallets continuously from kyoto's event stream;
+			// `Node::sync_wallets` routes through `poll_and_update_listeners` for the
+			// "wait until caught up" semantics.
+			ChainSourceKind::Cbf { .. } => false,
 		}
 	}
 
@@ -338,26 +341,15 @@ impl ChainSource {
 					.await
 			},
 			ChainSourceKind::Cbf(cbf_chain_source) => {
-				if let Some(background_sync_config) =
-					cbf_chain_source.sync_config.background_sync_config.as_ref()
-				{
-					self.start_tx_based_sync_loop(
+				cbf_chain_source
+					.continuously_sync_wallets(
 						stop_sync_receiver,
 						onchain_wallet,
 						channel_manager,
 						chain_monitor,
 						output_sweeper,
-						background_sync_config,
-						Arc::clone(&self.logger),
 					)
 					.await
-				} else {
-					log_info!(
-						self.logger,
-						"Background syncing is disabled. Manual syncing required for onchain wallet, lightning wallet, and fee rate updates.",
-					);
-					return;
-				}
 			},
 		}
 	}
@@ -438,8 +430,10 @@ impl ChainSource {
 				// `ChainPoller`. So nothing to do here.
 				unreachable!("Onchain wallet will be synced via chain polling")
 			},
-			ChainSourceKind::Cbf(cbf_chain_source) => {
-				cbf_chain_source.sync_onchain_wallet(onchain_wallet).await
+			ChainSourceKind::Cbf { .. } => {
+				// In CBF mode we sync both wallets continuously via kyoto's push-based
+				// event stream in `continuously_sync_wallets`. So nothing to do here.
+				unreachable!("CBF wallets are synced via the kyoto event loop")
 			},
 		}
 	}
@@ -466,10 +460,10 @@ impl ChainSource {
 				// `ChainPoller`. So nothing to do here.
 				unreachable!("Lightning wallet will be synced via chain polling")
 			},
-			ChainSourceKind::Cbf(cbf_chain_source) => {
-				cbf_chain_source
-					.sync_lightning_wallet(channel_manager, chain_monitor, output_sweeper)
-					.await
+			ChainSourceKind::Cbf { .. } => {
+				// In CBF mode we sync both wallets continuously via kyoto's push-based
+				// event stream in `continuously_sync_wallets`. So nothing to do here.
+				unreachable!("CBF wallets are synced via the kyoto event loop")
 			},
 		}
 	}
@@ -499,9 +493,12 @@ impl ChainSource {
 					)
 					.await
 			},
-			ChainSourceKind::Cbf { .. } => {
-				// In CBF mode we sync wallets via compact block filters.
-				unreachable!("Listeners will be synced via compact block filter syncing")
+			ChainSourceKind::Cbf(cbf_chain_source) => {
+				// CBF advances all listeners continuously inside `continuously_sync_wallets`.
+				// Here we just wait until both wallets have reached the current network tip.
+				let _ = chain_monitor;
+				let _ = output_sweeper;
+				cbf_chain_source.sync_wallets(onchain_wallet, channel_manager).await
 			},
 		}
 	}

@@ -323,6 +323,11 @@ pub(crate) fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
 	bitcoind_conf.network = "regtest";
 	bitcoind_conf.args.push("-rest");
 
+       bitcoind_conf.args.push("-debuglogfile=/tmp/bitcoind_test.log");
+      bitcoind_conf.args.push("-debug=net");
+      bitcoind_conf.args.push("-debug=cmpctblock");
+
+
 	bitcoind_conf.p2p = corepc_node::P2P::Yes;
 	bitcoind_conf.args.push("-blockfilterindex=1");
 	bitcoind_conf.args.push("-peerblockfilters=1");

@@ -1448,13 +1448,21 @@ impl Wallet {
 
 impl Listen for Wallet {
 	fn filtered_block_connected(
-		&self, _header: &bitcoin::block::Header,
-		_txdata: &lightning::chain::transaction::TransactionData, _height: u32,
+		&self, header: &bitcoin::block::Header,
+		txdata: &lightning::chain::transaction::TransactionData, height: u32,
 	) {
-		debug_assert!(false, "Syncing filtered blocks is currently not supported");
-		// As far as we can tell this would be a no-op anyways as we don't have to tell BDK about
-		// the header chain of intermediate blocks. According to the BDK team, it's sufficient to
-		// only connect full blocks starting from the last point of disagreement.
+		// Under filter-based chain sources (CBF), BDK needs every header to keep its
+		// `LocalChain` advancing, while only the LDK-pre-filtered subset of txs is available.
+		// Build a synthetic block with the real header and the provided txdata and delegate
+		// to `block_connected`: BDK's `apply_block_relevant` re-filters by keychain (a no-op
+		// when `txdata` is empty for non-matching blocks), and the `registered_txids` /
+		// payment-store handling stays in one place. BDK does not verify the merkle root,
+		// so the header/txdata mismatch is invisible.
+		let synthetic_block = bitcoin::Block {
+			header: *header,
+			txdata: txdata.iter().map(|(_, tx)| (*tx).clone()).collect(),
+		};
+		self.block_connected(&synthetic_block, height);
 	}
 
 	fn block_connected(&self, block: &bitcoin::Block, height: u32) {
