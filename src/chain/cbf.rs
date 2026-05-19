@@ -230,15 +230,11 @@ impl CbfChainSource {
 			builder = builder.add_peers(trusted_peers);
 		}
 
-		// Require multiple peers to agree on filter headers before accepting them,
-		// as recommended by BIP 157 to mitigate malicious peer attacks.
+		// Require multiple peers to agree on filter headers before accepting them.
 		builder = builder.required_peers(sync_config.required_peers);
 
-		// Request witness data so segwit transactions include full witnesses,
-		// required for Lightning channel operations.
+		// Witness data is required for Lightning channel operations.
 		builder = builder.fetch_witness_data();
-
-		// Set peer response timeout from user configuration (default: 30s).
 		builder = builder.response_timeout(Duration::from_secs(sync_config.response_timeout_secs));
 
 		// If we have a wallet reference, derive a chain_state checkpoint so the
@@ -443,7 +439,10 @@ impl CbfChainSource {
 			Some(rx) => rx,
 			None => {
 				debug_assert!(false, "continuously_sync_wallets called concurrently");
-				log_error!(self.logger, "CBF event receiver already taken — sync loop will not run.");
+				log_error!(
+					self.logger,
+					"CBF event receiver already taken — sync loop will not run."
+				);
 				return;
 			},
 		};
@@ -548,14 +547,18 @@ impl CbfChainSource {
 							return;
 						},
 					};
+					// Opportunistically seed the fee cache: this block is already in
+					// memory, so the next fee-estimation cycle won't need to re-fetch
+					// it over P2P.
+					if let Some(fee_rate) =
+						compute_block_fee_rate(height, &block, self.config.network)
+					{
+						self.insert_block_fee_cache(block_hash, fee_rate);
+					}
 					let txdata: Vec<(usize, &Transaction)> =
 						block.txdata.iter().enumerate().collect();
 					listener.filtered_block_connected(&block.header, &txdata, height);
-					log_trace!(
-						self.logger,
-						"CBF: applied matched block at height {}",
-						height
-					);
+					log_trace!(self.logger, "CBF: applied matched block at height {}", height);
 				} else {
 					let header = match requester.get_header(height).await {
 						Ok(Some(indexed_header)) => indexed_header.header,
@@ -691,9 +694,22 @@ impl CbfChainSource {
 		self.registered_scripts.lock().expect("lock").insert(output.script_pubkey.clone());
 	}
 
-    ///This function is an artefact of the public contract. With CBF push model (kyoto receives
-    ///block => propagates updates) we just need to be sure that we have processes all blocks up to
-    ///kyoto's tip, we have no other way to sync.
+	/// Insert a computed fee rate into the block fee cache (no-op on duplicate hash),
+	/// evicting the oldest entry if at [`BLOCK_FEE_CACHE_CAPACITY`].
+	fn insert_block_fee_cache(&self, hash: BlockHash, fee_rate: FeeRate) {
+		let mut cache = self.block_fee_cache.lock().expect("lock");
+		if cache.iter().any(|(h, _)| *h == hash) {
+			return;
+		}
+		if cache.len() == BLOCK_FEE_CACHE_CAPACITY {
+			cache.pop_front();
+		}
+		cache.push_back((hash, fee_rate));
+	}
+
+	///This function is an artefact of the public contract. With CBF push model (kyoto receives
+	///block => propagates updates) we just need to be sure that we have processes all blocks up to
+	///kyoto's tip, we have no other way to sync.
 	pub(crate) async fn sync_wallets(
 		&self, onchain_wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>,
 	) -> Result<(), Error> {
@@ -944,44 +960,19 @@ impl CbfChainSource {
 					},
 				};
 
-			let block = &indexed_block.block;
-			let weight_kwu = block.weight().to_kwu_floor();
+			let fee_rate =
+				match compute_block_fee_rate(height, &indexed_block.block, self.config.network) {
+					Some(fr) => fr,
+					None => {
+						log_error!(
+							self.logger,
+							"Failed to retrieve fee rate estimates: zero block fees are disallowed on Mainnet.",
+						);
+						return Err(Error::FeerateEstimationUpdateFailed);
+					},
+				};
 
-			// Compute fee rate: (coinbase_output - subsidy) / weight.
-			// For blocks with zero weight (e.g. coinbase-only in regtest), use the floor rate.
-			let fee_rate_sat_per_kwu = if weight_kwu == 0 {
-				MIN_FEERATE_SAT_PER_KWU
-			} else {
-				let subsidy = block_subsidy(height);
-				let revenue = block
-					.txdata
-					.first()
-					.map(|tx| tx.output.iter().map(|o| o.value).sum())
-					.unwrap_or(Amount::ZERO);
-				let block_fees = revenue.checked_sub(subsidy).unwrap_or(Amount::ZERO);
-
-				if block_fees == Amount::ZERO && self.config.network == Network::Bitcoin {
-					log_error!(
-						self.logger,
-						"Failed to retrieve fee rate estimates: zero block fees are disallowed on Mainnet.",
-					);
-					return Err(Error::FeerateEstimationUpdateFailed);
-				}
-
-				(block_fees.to_sat() / weight_kwu).max(MIN_FEERATE_SAT_PER_KWU)
-			};
-
-			let fee_rate = FeeRate::from_sat_per_kwu(fee_rate_sat_per_kwu);
-
-			// Insert into the cache, evicting the oldest entry if at capacity.
-			{
-				let mut cache = self.block_fee_cache.lock().expect("lock");
-				if cache.len() == BLOCK_FEE_CACHE_CAPACITY {
-					cache.pop_front();
-				}
-				cache.push_back((current_hash, fee_rate));
-			}
-
+			self.insert_block_fee_cache(current_hash, fee_rate);
 			block_fee_rates.push(fee_rate);
 		}
 
@@ -1213,6 +1204,31 @@ fn update_node_metrics_timestamp(
 	update_and_persist_node_metrics(node_metrics, kv_store, logger, |metrics| {
 		setter(metrics, unix_time_secs_opt);
 	})
+}
+
+/// Compute the per-block fee rate from a block's coinbase output and weight.
+///
+/// Returns `None` if the block has zero fees on Mainnet — such a sample is treated
+/// as untrustworthy (no legitimate Mainnet block has zero fees today) and callers
+/// should refuse to use or cache it.
+fn compute_block_fee_rate(
+	height: u32, block: &bitcoin::Block, network: Network,
+) -> Option<FeeRate> {
+	let weight_kwu = block.weight().to_kwu_floor();
+	if weight_kwu == 0 {
+		return Some(FeeRate::from_sat_per_kwu(MIN_FEERATE_SAT_PER_KWU));
+	}
+	let subsidy = block_subsidy(height);
+	let revenue: Amount = block
+		.txdata
+		.first()
+		.map(|tx| tx.output.iter().map(|o| o.value).sum())
+		.unwrap_or(Amount::ZERO);
+	let block_fees = revenue.checked_sub(subsidy).unwrap_or(Amount::ZERO);
+	if block_fees == Amount::ZERO && network == Network::Bitcoin {
+		return None;
+	}
+	Some(FeeRate::from_sat_per_kwu((block_fees.to_sat() / weight_kwu).max(MIN_FEERATE_SAT_PER_KWU)))
 }
 
 /// Compute the block subsidy (mining reward before fees) at the given block height.
