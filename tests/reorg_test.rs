@@ -7,10 +7,12 @@ use ldk_node::{Event, LightningBalance, PendingSweepBalance};
 use proptest::prelude::prop;
 use proptest::proptest;
 
+use std::time::Duration;
+
 use crate::common::{
 	expect_event, generate_blocks_and_wait, invalidate_blocks, open_channel,
 	premine_and_distribute_funds, random_chain_source, random_config, setup_bitcoind_and_electrsd,
-	setup_node, wait_for_outpoint_spend,
+	setup_node, wait_for_mempool_size, wait_for_outpoint_spend,
 };
 
 proptest! {
@@ -170,6 +172,9 @@ proptest! {
 						_ => panic!("Unexpected balance state!"),
 					}
 
+					// Wait for the sweep tx to land in bitcoind's mempool before
+					// mining, so the block actually includes it.
+					wait_for_mempool_size(&bitcoind, 1, Duration::from_secs(30)).await;
 					generate_blocks_and_wait(&bitcoind, electrs, 1).await;
 					node.sync_wallets().unwrap();
 					assert!(node.list_balances().lightning_balances.len() < 2);

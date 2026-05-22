@@ -21,7 +21,8 @@ use bip157::{
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
 use bitcoin::{Amount, FeeRate, Network, Script, ScriptBuf, Transaction, Txid};
 use electrum_client::ElectrumApi;
-use lightning::chain::{Listen, WatchedOutput};
+use lightning::chain::chaininterface::ConfirmationTarget as LdkConfirmationTarget;
+use lightning::chain::{BestBlock, Listen, WatchedOutput};
 use lightning::util::ser::Writeable;
 use tokio::sync::mpsc;
 
@@ -29,8 +30,8 @@ use super::{FeeSourceConfig, WalletSyncStatus};
 use crate::config::{CbfSyncConfig, Config};
 use crate::error::Error;
 use crate::fee_estimator::{
-	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
-	OnchainFeeEstimator,
+	apply_post_estimation_adjustments, get_all_conf_targets, get_fallback_rate_for_target,
+	get_num_block_defaults_for_target, ConfirmationTarget, OnchainFeeEstimator,
 };
 use crate::io::utils::update_and_persist_node_metrics;
 use crate::logger::{log_bytes, log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
@@ -129,29 +130,164 @@ pub(crate) struct ChainListener {
 	pub(crate) output_sweeper: Arc<Sweeper>,
 }
 
-impl Listen for ChainListener {
-	fn filtered_block_connected(
+impl ChainListener {
+	/// Fan out a connected block to every listener that hasn't already processed it.
+	///
+	/// Kyoto can re-emit `IndexedFilter` events below LDK's persisted tip (e.g. after a
+	/// restart that resumes from a checkpoint behind the listener heights). LDK's
+	/// `ChannelManager` and `OutputSweeper` assert strict chain order in
+	/// `filtered_block_connected`, so we per-listener-gate using each component's
+	/// current best block.
+	fn apply_filtered_block_connected(
 		&self, header: &bitcoin::block::Header,
-		txdata: &lightning::chain::transaction::TransactionData, height: u32,
+		txdata: &lightning::chain::transaction::TransactionData, height: u32, logger: &Logger,
 	) {
-		self.onchain_wallet.filtered_block_connected(header, txdata, height);
-		self.channel_manager.filtered_block_connected(header, txdata, height);
-		self.chain_monitor.filtered_block_connected(header, txdata, height);
-		self.output_sweeper.filtered_block_connected(header, txdata, height);
+		let prev = header.prev_blockhash;
+
+		gated_filtered_block_connected(
+			"onchain_wallet",
+			self.onchain_wallet.current_best_block(),
+			header,
+			txdata,
+			height,
+			logger,
+			|h, t, ht| self.onchain_wallet.filtered_block_connected(h, t, ht),
+		);
+		gated_filtered_block_connected(
+			"channel_manager",
+			self.channel_manager.current_best_block(),
+			header,
+			txdata,
+			height,
+			logger,
+			|h, t, ht| self.channel_manager.filtered_block_connected(h, t, ht),
+		);
+		gated_filtered_block_connected(
+			"output_sweeper",
+			self.output_sweeper.current_best_block(),
+			header,
+			txdata,
+			height,
+			logger,
+			|h, t, ht| self.output_sweeper.filtered_block_connected(h, t, ht),
+		);
+
+		// ChainMonitor wraps multiple ChannelMonitors with independent best blocks. We
+		// inspect each monitor's tip and only forward when at least one is at height-1
+		// with the matching hash. Monitors already past `height` are no-ops inside
+		// `process_chain_data` (transactions_confirmed is idempotent on confirmed txs).
+		let mut any_ready = false;
+		let mut any_behind = false;
+		for channel_id in self.chain_monitor.list_monitors() {
+			if let Ok(monitor) = self.chain_monitor.get_monitor(channel_id) {
+				let best = monitor.current_best_block();
+				if best.height + 1 == height && best.block_hash == prev {
+					any_ready = true;
+				} else if best.height < height {
+					any_behind = true;
+				}
+			}
+		}
+		if any_ready {
+			self.chain_monitor.filtered_block_connected(header, txdata, height);
+		} else if any_behind {
+			log_debug!(
+				logger,
+				"CBF dispatch: skipping chain_monitor at height {} (prev_blockhash {}); no monitor at height-1 with matching hash.",
+				height,
+				prev,
+			);
+		}
 	}
 
-	fn block_connected(&self, block: &bitcoin::Block, height: u32) {
-		self.onchain_wallet.block_connected(block, height);
-		self.channel_manager.block_connected(block, height);
-		self.chain_monitor.block_connected(block, height);
-		self.output_sweeper.block_connected(block, height);
-	}
+	/// Fan out a chain rewind to every listener whose tip is above the fork point.
+	///
+	/// LDK's `ChannelManager` and `OutputSweeper` assert `best.height > fork_point.height`
+	/// in `blocks_disconnected`. Skip listeners that are already at or below the fork point.
+	fn apply_blocks_disconnected(&self, fork_point: BestBlock, logger: &Logger) {
+		gated_blocks_disconnected(
+			"onchain_wallet",
+			self.onchain_wallet.current_best_block(),
+			fork_point,
+			logger,
+			|fp| self.onchain_wallet.blocks_disconnected(fp),
+		);
+		gated_blocks_disconnected(
+			"channel_manager",
+			self.channel_manager.current_best_block(),
+			fork_point,
+			logger,
+			|fp| self.channel_manager.blocks_disconnected(fp),
+		);
+		gated_blocks_disconnected(
+			"output_sweeper",
+			self.output_sweeper.current_best_block(),
+			fork_point,
+			logger,
+			|fp| self.output_sweeper.blocks_disconnected(fp),
+		);
 
-	fn blocks_disconnected(&self, fork_point_block: lightning::chain::BestBlock) {
-		self.onchain_wallet.blocks_disconnected(fork_point_block);
-		self.channel_manager.blocks_disconnected(fork_point_block);
-		self.chain_monitor.blocks_disconnected(fork_point_block);
-		self.output_sweeper.blocks_disconnected(fork_point_block);
+		let any_past = self
+			.chain_monitor
+			.list_monitors()
+			.into_iter()
+			.flat_map(|id| self.chain_monitor.get_monitor(id))
+			.any(|m| m.current_best_block().height > fork_point.height);
+		if any_past {
+			self.chain_monitor.blocks_disconnected(fork_point);
+		}
+	}
+}
+
+fn gated_filtered_block_connected<F>(
+	name: &str, best: BestBlock, header: &bitcoin::block::Header,
+	txdata: &lightning::chain::transaction::TransactionData, height: u32, logger: &Logger, apply: F,
+) where
+	F: FnOnce(&bitcoin::block::Header, &lightning::chain::transaction::TransactionData, u32),
+{
+	if best.height + 1 == height && best.block_hash == header.prev_blockhash {
+		apply(header, txdata, height);
+	} else if best.height >= height {
+		// Listener has already processed this block (or a later one). Re-emission from
+		// kyoto after a restart is expected; silently skip.
+		log_trace!(
+			logger,
+			"CBF dispatch: skipping {} at height {} (already at {}).",
+			name,
+			height,
+			best.height,
+		);
+	} else {
+		// Gap larger than a single block, or hash mismatch at the expected height.
+		// Either kyoto is re-emitting a fork we already disconnected, or there's a
+		// genuine inconsistency we can't paper over here.
+		log_debug!(
+			logger,
+			"CBF dispatch: skipping {} at height {} (best={} hash={}, incoming prev_blockhash={}).",
+			name,
+			height,
+			best.height,
+			best.block_hash,
+			header.prev_blockhash,
+		);
+	}
+}
+
+fn gated_blocks_disconnected<F>(
+	name: &str, best: BestBlock, fork_point: BestBlock, logger: &Logger, apply: F,
+) where
+	F: FnOnce(BestBlock),
+{
+	if best.height > fork_point.height {
+		apply(fork_point);
+	} else {
+		log_trace!(
+			logger,
+			"CBF dispatch: skipping {} blocks_disconnected at fork {} (already at {}).",
+			name,
+			fork_point.height,
+			best.height,
+		);
 	}
 }
 
@@ -557,37 +693,53 @@ impl CbfChainSource {
 					}
 					let txdata: Vec<(usize, &Transaction)> =
 						block.txdata.iter().enumerate().collect();
-					listener.filtered_block_connected(&block.header, &txdata, height);
+					listener.apply_filtered_block_connected(
+						&block.header,
+						&txdata,
+						height,
+						&self.logger,
+					);
 					log_trace!(self.logger, "CBF: applied matched block at height {}", height);
 				} else {
-					let header = match requester.get_header(height).await {
+					// Look up the header by the filter's `block_hash`, not by
+					// `height`: a height-based lookup can race with kyoto's
+					// header indexing (returning `None` or, after a reorg, a
+					// different header at that height) and would feed LDK a
+					// header whose `prev_blockhash` doesn't match its tip — the
+					// chain-order assertion in `ChannelManager` then permanently
+					// wedges the listener chain.
+					let header = match requester.get_header_by_hash(block_hash).await {
 						Ok(Some(indexed_header)) => indexed_header.header,
 						Ok(None) => {
 							log_error!(
 								self.logger,
-								"CBF: header not found in local chain for height {}",
-								height
+								"CBF: header not found in local chain for filter at \
+								 height={}, block_hash={}; aborting chain advance to \
+								 avoid feeding LDK a stale/wrong header.",
+								height,
+								block_hash,
 							);
 							return;
 						},
 						Err(e) => {
 							log_error!(
 								self.logger,
-								"CBF: failed to look up header at height {}: {:?}",
+								"CBF: failed to look up header for block_hash={} (height={}): {:?}",
+								block_hash,
 								height,
-								e
+								e,
 							);
 							return;
 						},
 					};
-					listener.filtered_block_connected(&header, &[], height);
+					listener.apply_filtered_block_connected(&header, &[], height, &self.logger);
 				}
 			},
 			Event::ChainUpdate(BlockHeaderChanges::Reorganized { accepted, reorganized }) => {
 				// Kyoto sorts `reorganized` ascending by height, so `first()` is the
 				// lowest reorganized block and the fork point is one below it.
 				if let Some(first_reorg) = reorganized.first() {
-					let fork_point = lightning::chain::BestBlock::new(
+					let fork_point = BestBlock::new(
 						first_reorg.header.prev_blockhash,
 						first_reorg.height.saturating_sub(1),
 					);
@@ -598,7 +750,7 @@ impl CbfChainSource {
 						reorganized.len(),
 						accepted.len(),
 					);
-					listener.blocks_disconnected(fork_point);
+					listener.apply_blocks_disconnected(fork_point, &self.logger);
 					// The `accepted` headers will arrive as subsequent IndexedFilter
 					// events; `dispatch_event` will re-extend the chain via the
 					// matched / non-matched paths.
@@ -856,9 +1008,12 @@ impl CbfChainSource {
 				);
 				return Ok(None);
 			},
-			Err(e) => {
-				log_error!(self.logger, "Timed out fetching CBF chain tip: {}", e);
-				return Err(Error::FeerateEstimationUpdateTimeout);
+			Err(_) => {
+				// Transient kyoto contention. No samples collected yet, so we
+				// have nothing to fall back to this cycle; the previously-set
+				// fee_estimator cache (if any) stays in effect.
+				log_debug!(self.logger, "Timed out fetching CBF chain tip for fee estimation.");
+				return Ok(None);
 			},
 		};
 
@@ -879,7 +1034,12 @@ impl CbfChainSource {
 		// (decrementing a counter) rather than by `prev_blockhash` so that cache
 		// hits don't have to read any data out of the cached block — the hash for
 		// the next height comes from kyoto's local header chain via `get_header`.
+		//
+		// `used_hashes` records hashes whose fee rate we already counted this cycle
+		// (either via cache hit or fresh fetch). The post-loop padding step uses it
+		// to avoid double-counting when filling samples from `block_fee_cache`.
 		let mut block_fee_rates: Vec<FeeRate> = Vec::with_capacity(FEE_RATE_LOOKBACK_BLOCKS);
+		let mut used_hashes: Vec<BlockHash> = Vec::with_capacity(FEE_RATE_LOOKBACK_BLOCKS);
 		let mut cache_hits = 0usize;
 
 		for offset in 0..FEE_RATE_LOOKBACK_BLOCKS {
@@ -892,19 +1052,22 @@ impl CbfChainSource {
 					log_debug!(
 						self.logger,
 						"CBF header at height {} not yet in local chain; \
-						 skipping fee estimation cycle.",
+						 falling back to {} samples already collected.",
 						height,
+						block_fee_rates.len(),
 					);
-					return Ok(None);
+					break;
 				},
 				Err(e) => {
-					log_error!(
+					log_debug!(
 						self.logger,
-						"Failed to look up header at height {}: {:?}",
+						"Failed to look up header at height {}: {:?}; \
+						 falling back to {} samples already collected.",
 						height,
-						e
+						e,
+						block_fee_rates.len(),
 					);
-					return Err(Error::FeerateEstimationUpdateFailed);
+					break;
 				},
 			};
 
@@ -919,14 +1082,20 @@ impl CbfChainSource {
 			if let Some(fee_rate) = cached {
 				cache_hits += 1;
 				block_fee_rates.push(fee_rate);
+				used_hashes.push(current_hash);
 				continue;
 			}
 
 			// Cache miss: fetch the full block over P2P and compute the fee rate.
 			let remaining_timeout = timeout.saturating_sub(fetch_start.elapsed());
 			if remaining_timeout.is_zero() {
-				log_error!(self.logger, "Updating fee rate estimates timed out.");
-				return Err(Error::FeerateEstimationUpdateTimeout);
+				log_debug!(
+					self.logger,
+					"Fee rate cache budget exhausted after {} samples; \
+					 falling back to existing data.",
+					block_fee_rates.len(),
+				);
+				break;
 			}
 
 			let indexed_block =
@@ -937,26 +1106,38 @@ impl CbfChainSource {
 					Ok(Err(FetchBlockError::UnknownHash)) => {
 						// Kyoto doesn't know this block yet (e.g. startup before
 						// filter sync, or hash is at/below the resume checkpoint).
-						// Skip this cycle and try again later.
 						log_debug!(
 							self.logger,
 							"CBF node does not yet have block {} for fee estimation; \
-							 skipping until sync progresses.",
+							 falling back to {} samples already collected.",
 							current_hash,
+							block_fee_rates.len(),
 						);
-						return Ok(None);
+						break;
 					},
 					Ok(Err(e)) => {
-						log_error!(
+						log_debug!(
 							self.logger,
-							"Failed to fetch block for fee estimation: {:?}",
-							e
+							"Failed to fetch block for fee estimation: {:?}; \
+							 falling back to {} samples already collected.",
+							e,
+							block_fee_rates.len(),
 						);
-						return Err(Error::FeerateEstimationUpdateFailed);
+						break;
 					},
-					Err(e) => {
-						log_error!(self.logger, "Updating fee rate estimates timed out: {}", e);
-						return Err(Error::FeerateEstimationUpdateTimeout);
+					Err(_) => {
+						// Fall back to whatever samples we've already collected
+						// (cache hits + earlier fresh fetches). The post-loop guard
+						// rejects a completely empty result, so callers still see
+						// an error if we couldn't sample any blocks at all.
+						log_debug!(
+							self.logger,
+							"Timed out fetching block at height {} for fee estimation; \
+							 falling back to {} samples already collected.",
+							height,
+							block_fee_rates.len(),
+						);
+						break;
 					},
 				};
 
@@ -964,21 +1145,51 @@ impl CbfChainSource {
 				match compute_block_fee_rate(height, &indexed_block.block, self.config.network) {
 					Some(fr) => fr,
 					None => {
-						log_error!(
+						log_debug!(
 							self.logger,
-							"Failed to retrieve fee rate estimates: zero block fees are disallowed on Mainnet.",
+							"Skipping zero-fee block at height {} on Mainnet for fee estimation.",
+							height,
 						);
-						return Err(Error::FeerateEstimationUpdateFailed);
+						continue;
 					},
 				};
 
 			self.insert_block_fee_cache(current_hash, fee_rate);
 			block_fee_rates.push(fee_rate);
+			used_hashes.push(current_hash);
 		}
 
+		// Pad the sample set from the hash-indexed block_fee_cache. Entries from
+		// prior cycles are still factually correct for the blocks they reference,
+		// and `select_fee_rate_for_target` only cares about the fee-rate
+		// distribution (not block ordering), so non-consecutive samples are fine.
+		// This recovers fee estimation in the common cold-start case where the
+		// recent N tip-backward heights happen to be non-matching blocks that we
+		// never fetched.
+		let pad_start_len = block_fee_rates.len();
+		if block_fee_rates.len() < FEE_RATE_LOOKBACK_BLOCKS {
+			let cache = self.block_fee_cache.lock().expect("lock");
+			for (hash, rate) in cache.iter().rev() {
+				if block_fee_rates.len() >= FEE_RATE_LOOKBACK_BLOCKS {
+					break;
+				}
+				if used_hashes.contains(hash) {
+					continue;
+				}
+				block_fee_rates.push(*rate);
+			}
+		}
+		let padded_from_cache = block_fee_rates.len() - pad_start_len;
+
 		if block_fee_rates.is_empty() {
-			log_error!(self.logger, "No blocks available for fee rate estimation.");
-			return Err(Error::FeerateEstimationUpdateFailed);
+			// Truly cold start: no recent block sampled, cache also empty. Keep
+			// any previously-set fee_estimator cache rather than overwriting it
+			// with a floor-only distribution.
+			log_debug!(
+				self.logger,
+				"No fee rate samples available this cycle (cache empty); keeping previous estimate."
+			);
+			return Ok(None);
 		}
 
 		block_fee_rates.sort();
@@ -989,7 +1200,33 @@ impl CbfChainSource {
 		for target in confirmation_targets {
 			let num_blocks = get_num_block_defaults_for_target(target);
 			let base_fee_rate = select_fee_rate_for_target(&block_fee_rates, num_blocks);
-			let adjusted_fee_rate = apply_post_estimation_adjustments(target, base_fee_rate);
+
+			// Coinbase-derived rates are demand-blind: on low-activity chains
+			// (regtest, quiet periods, fresh signet) blocks contain little or
+			// no real fee revenue, so the percentile picks bottom out near
+			// `MIN_FEERATE_SAT_PER_KWU` (= 1 sat/vB). For targets where a stuck
+			// tx hurts the user (sweep / output spending), that risks falling
+			// under mempool minrelay or RBF-incremental thresholds and triggers
+			// needless rebroadcast/fee-bump loops. Clamp those at their LDK
+			// fallback rates. Non-urgent targets (regular payments, channel
+			// funding) keep the coinbase-derived estimate — inflating them
+			// would overspend on naturally low-fee chains.
+			let needs_floor = matches!(
+				target,
+				ConfirmationTarget::Lightning(LdkConfirmationTarget::UrgentOnChainSweep)
+					| ConfirmationTarget::Lightning(
+						LdkConfirmationTarget::OutputSpendingFee,
+					),
+			);
+			let effective_fee_rate = if needs_floor {
+				let fallback =
+					FeeRate::from_sat_per_kwu(get_fallback_rate_for_target(target) as u64);
+				base_fee_rate.max(fallback)
+			} else {
+				base_fee_rate
+			};
+
+			let adjusted_fee_rate = apply_post_estimation_adjustments(target, effective_fee_rate);
 			new_fee_rate_cache.insert(target, adjusted_fee_rate);
 
 			log_trace!(
@@ -1002,10 +1239,11 @@ impl CbfChainSource {
 
 		log_debug!(
 			self.logger,
-			"CBF fee rate estimation finished in {}ms ({} blocks sampled, {} cache hits).",
+			"CBF fee rate estimation finished in {}ms ({} blocks sampled, {} cache hits, {} padded from cache).",
 			now.elapsed().as_millis(),
 			block_fee_rates.len(),
 			cache_hits,
+			padded_from_cache,
 		);
 
 		Ok(Some(new_fee_rate_cache))

@@ -445,15 +445,20 @@ async fn onchain_send_receive() {
 		node_b.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Onchain { .. }));
 	assert_eq!(node_b_payments.len(), 2);
 
-	let onchain_fee_buffer_sat = 1000;
 	let expected_node_a_balance = premine_amount_sat - reserve_amount_sat;
-	let expected_node_b_balance_lower =
-		premine_amount_sat - channel_amount_sat - reserve_amount_sat - onchain_fee_buffer_sat;
-	let expected_node_b_balance_upper =
-		premine_amount_sat - channel_amount_sat - reserve_amount_sat;
+	let node_b_funding_fee_sat = node_b
+		.list_payments_with_filter(|p| {
+			matches!(p.kind, PaymentKind::Onchain { .. })
+				&& p.direction == PaymentDirection::Outbound
+		})
+		.first()
+		.unwrap()
+		.fee_paid_msat
+		.unwrap() / 1000;
+	let expected_node_b_balance =
+		premine_amount_sat - channel_amount_sat - reserve_amount_sat - node_b_funding_fee_sat;
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, expected_node_a_balance);
-	assert!(node_b.list_balances().spendable_onchain_balance_sats > expected_node_b_balance_lower);
-	assert!(node_b.list_balances().spendable_onchain_balance_sats < expected_node_b_balance_upper);
+	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, expected_node_b_balance);
 
 	assert_eq!(
 		Err(NodeError::InsufficientFunds),
@@ -505,11 +510,10 @@ async fn onchain_send_receive() {
 	node_b.sync_wallets().unwrap();
 
 	let expected_node_a_balance = expected_node_a_balance + amount_to_send_sats;
-	let expected_node_b_balance_lower = expected_node_b_balance_lower - amount_to_send_sats;
-	let expected_node_b_balance_upper = expected_node_b_balance_upper - amount_to_send_sats;
+	let send_fee_sat = payment_b.fee_paid_msat.unwrap() / 1000;
+	let expected_node_b_balance = expected_node_b_balance - amount_to_send_sats - send_fee_sat;
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, expected_node_a_balance);
-	assert!(node_b.list_balances().spendable_onchain_balance_sats > expected_node_b_balance_lower);
-	assert!(node_b.list_balances().spendable_onchain_balance_sats < expected_node_b_balance_upper);
+	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, expected_node_b_balance);
 
 	let node_a_payments =
 		node_a.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Onchain { .. }));
@@ -538,19 +542,23 @@ async fn onchain_send_receive() {
 
 	let addr_b = node_b.onchain_payment().new_address().unwrap();
 	let txid = node_a.onchain_payment().send_all_to_address(&addr_b, true, None).unwrap();
-	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	wait_for_tx(&electrsd.client, txid).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 
-	let expected_node_b_balance_lower = expected_node_b_balance_lower + expected_node_a_balance;
-	let expected_node_b_balance_upper = expected_node_b_balance_upper + expected_node_a_balance;
+	let send_all_fee_sat = node_a
+		.payment(&PaymentId(txid.to_byte_array()))
+		.unwrap()
+		.fee_paid_msat
+		.unwrap() / 1000;
+	let expected_node_b_balance =
+		expected_node_b_balance + expected_node_a_balance - send_all_fee_sat;
 	let expected_node_a_balance = 0;
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, expected_node_a_balance);
 	assert_eq!(node_a.list_balances().total_onchain_balance_sats, reserve_amount_sat);
-	assert!(node_b.list_balances().spendable_onchain_balance_sats > expected_node_b_balance_lower);
-	assert!(node_b.list_balances().spendable_onchain_balance_sats < expected_node_b_balance_upper);
+	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, expected_node_b_balance);
 
 	let node_a_payments =
 		node_a.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Onchain { .. }));
@@ -561,20 +569,26 @@ async fn onchain_send_receive() {
 
 	let addr_b = node_b.onchain_payment().new_address().unwrap();
 	let txid = node_a.onchain_payment().send_all_to_address(&addr_b, false, None).unwrap();
-	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	wait_for_tx(&electrsd.client, txid).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 
-	let expected_node_b_balance_lower = expected_node_b_balance_lower + reserve_amount_sat;
-	let expected_node_b_balance_upper = expected_node_b_balance_upper + reserve_amount_sat;
+	let send_all_no_reserve_fee_sat = node_a
+		.payment(&PaymentId(txid.to_byte_array()))
+		.unwrap()
+		.fee_paid_msat
+		.unwrap() / 1000;
+	// node_a sends its full balance (reserve_amount_sat after the previous step) to node_b,
+	// minus the tx fee.
+	let expected_node_b_balance =
+		expected_node_b_balance + reserve_amount_sat - send_all_no_reserve_fee_sat;
 	let expected_node_a_balance = 0;
 
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, expected_node_a_balance);
 	assert_eq!(node_a.list_balances().total_onchain_balance_sats, expected_node_a_balance);
-	assert!(node_b.list_balances().spendable_onchain_balance_sats > expected_node_b_balance_lower);
-	assert!(node_b.list_balances().spendable_onchain_balance_sats < expected_node_b_balance_upper);
+	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, expected_node_b_balance);
 
 	let node_a_payments =
 		node_a.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Onchain { .. }));
@@ -596,7 +610,6 @@ async fn onchain_send_all_retains_reserve() {
 
 	let premine_amount_sat = 1_000_000;
 	let reserve_amount_sat = 25_000;
-	let onchain_fee_buffer_sat = 1000;
 	premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
@@ -619,9 +632,16 @@ async fn onchain_send_all_retains_reserve() {
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 	// Check node a sent all and node b received it
+	let send_all_fee_sat_1 = node_a
+		.payment(&PaymentId(txid.to_byte_array()))
+		.unwrap()
+		.fee_paid_msat
+		.unwrap() / 1000;
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 0);
-	assert!(((premine_amount_sat * 2 - onchain_fee_buffer_sat)..=(premine_amount_sat * 2))
-		.contains(&node_b.list_balances().spendable_onchain_balance_sats));
+	assert_eq!(
+		node_b.list_balances().spendable_onchain_balance_sats,
+		premine_amount_sat * 2 - send_all_fee_sat_1,
+	);
 
 	// Refill to make sure we have enough reserve for the channel open.
 	let txid = bitcoind
@@ -645,11 +665,21 @@ async fn onchain_send_all_retains_reserve() {
 	expect_channel_ready_event!(node_a, node_b.node_id());
 	expect_channel_ready_event!(node_b, node_a.node_id());
 
-	// Check node a sent all and node b received it
+	// Check node a sent all and node b received it. node_b paid a funding fee.
+	let node_b_funding_fee_sat = node_b
+		.list_payments_with_filter(|p| {
+			matches!(p.kind, PaymentKind::Onchain { .. })
+				&& p.direction == PaymentDirection::Outbound
+		})
+		.first()
+		.unwrap()
+		.fee_paid_msat
+		.unwrap() / 1000;
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 0);
-	assert!(((premine_amount_sat - reserve_amount_sat - onchain_fee_buffer_sat)
-		..=premine_amount_sat)
-		.contains(&node_b.list_balances().spendable_onchain_balance_sats));
+	assert_eq!(
+		node_b.list_balances().spendable_onchain_balance_sats,
+		premine_amount_sat * 2 - send_all_fee_sat_1 - premine_amount_sat - node_b_funding_fee_sat,
+	);
 
 	// Send all over again, this time ensuring the reserve is accounted for
 	let txid = node_b.onchain_payment().send_all_to_address(&addr_a, true, None).unwrap();
@@ -661,16 +691,24 @@ async fn onchain_send_all_retains_reserve() {
 	node_b.sync_wallets().unwrap();
 
 	// Check node b sent all and node a received it
+	let node_b_pre_send_balance =
+		premine_amount_sat * 2 - send_all_fee_sat_1 - premine_amount_sat - node_b_funding_fee_sat;
+	let send_all_fee_sat_2 = node_b
+		.payment(&PaymentId(txid.to_byte_array()))
+		.unwrap()
+		.fee_paid_msat
+		.unwrap() / 1000;
+	let expected_received_by_a = node_b_pre_send_balance - reserve_amount_sat - send_all_fee_sat_2;
 	assert_eq!(node_b.list_balances().total_onchain_balance_sats, reserve_amount_sat);
 	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, 0);
-	assert!(((premine_amount_sat - reserve_amount_sat - onchain_fee_buffer_sat)
-		..=premine_amount_sat)
-		.contains(&node_a.list_balances().spendable_onchain_balance_sats));
+	assert_eq!(
+		node_a.list_balances().spendable_onchain_balance_sats,
+		premine_amount_sat + expected_received_by_a,
+	);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn onchain_wallet_recovery() {
-
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
@@ -3300,16 +3338,14 @@ async fn onchain_send_receive_cbf() {
 	assert_eq!(payment_b.amount_msat, Some(amount_to_send_sats * 1000));
 	assert_eq!(payment_a.fee_paid_msat, payment_b.fee_paid_msat);
 
-	let onchain_fee_buffer_sat = 1000;
 	let expected_node_a_balance = premine_amount_sat + amount_to_send_sats;
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, expected_node_a_balance);
-	assert!(
-		node_b.list_balances().spendable_onchain_balance_sats
-			> premine_amount_sat - amount_to_send_sats - onchain_fee_buffer_sat
-	);
-	assert!(
-		node_b.list_balances().spendable_onchain_balance_sats
-			< premine_amount_sat - amount_to_send_sats
+	// Use the exact paid fee rather than a fuzzy buffer — fee rates depend on
+	// the configured chain source and can legitimately vary widely.
+	let actual_fee_sat = payment_b.fee_paid_msat.unwrap() / 1000;
+	assert_eq!(
+		node_b.list_balances().spendable_onchain_balance_sats,
+		premine_amount_sat - amount_to_send_sats - actual_fee_sat,
 	);
 
 	// Test send_all_to_address.

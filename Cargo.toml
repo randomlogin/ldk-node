@@ -137,6 +137,9 @@ check-cfg = [
 name = "payments"
 harness = false
 
+[patch.crates-io]
+bip157 = { path = "../kyoto" }
+
 #[patch.crates-io]
 #lightning = { path = "../rust-lightning/lightning" }
 #lightning-types = { path = "../rust-lightning/lightning-types" }
