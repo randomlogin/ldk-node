@@ -29,6 +29,8 @@ use lightning::chain::{BlockLocator, Filter};
 use crate::chain::bitcoind::{BitcoindChainSource, UtxoSourceClient};
 #[cfg(feature = "chain-cbf")]
 use crate::chain::cbf::CbfChainSource;
+#[cfg(feature = "chain-cbf")]
+pub use crate::chain::cbf::{CbfCustomSignet, CbfFeeSourceConfig};
 #[cfg(feature = "chain-electrum")]
 use crate::chain::electrum::ElectrumChainSource;
 #[cfg(feature = "chain-esplora")]
@@ -147,21 +149,6 @@ impl WalletSyncStatus {
 			}
 		}
 	}
-}
-
-/// Optional external fee estimation backend for the CBF chain source.
-///
-/// By default CBF derives fee rates from recent blocks' coinbase outputs.
-/// Setting an external source provides more accurate, per-target estimates
-/// from a mempool-aware server.
-#[cfg(feature = "chain-cbf")]
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-pub enum CbfFeeSourceConfig {
-	/// Use an Esplora HTTP server for fee rate estimation.
-	Esplora(String),
-	/// Use an Electrum server for fee rate estimation.
-	Electrum(String),
 }
 
 pub(crate) struct ChainSource {
@@ -398,7 +385,8 @@ impl ChainSource {
 
 	#[cfg(feature = "chain-cbf")]
 	pub(crate) fn new_cbf(
-		peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>, runtime: Arc<Runtime>,
+		peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>,
+		custom_signet: Option<CbfCustomSignet>, runtime: Arc<Runtime>,
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<PersistedNodeMetrics>,
@@ -406,6 +394,7 @@ impl ChainSource {
 		let cbf_chain_source = CbfChainSource::new(
 			peers,
 			fee_source_config,
+			custom_signet,
 			runtime,
 			Arc::clone(&fee_estimator),
 			Arc::clone(&kv_store),

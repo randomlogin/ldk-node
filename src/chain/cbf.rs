@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bip157::chain::ChainState;
 use bip157::{
 	chain::BlockHeaderChanges, Builder as KyotoBuilder, Client, Event as KyotoEvent,
-	HashCheckpoint, Header, IndexedBlock, Info, Node as KyotoNode, Package,
+	HashCheckpoint, Header, IndexedBlock, Info, Magic, Node as KyotoNode, Package,
 	Requester as KyotoRequester, TrustedPeer, Warning,
 };
 use bitcoin::{BlockHash, FeeRate, Network, Script, ScriptBuf, Transaction, Txid};
@@ -16,7 +16,7 @@ use lightning::chain::{BlockLocator, Listen, WatchedOutput};
 use tokio::sync::{mpsc, watch};
 
 use crate::chain::electrum::get_electrum_fee_rate_cache_update;
-use crate::chain::{CbfFeeSourceConfig, ChainListener};
+use crate::chain::ChainListener;
 use crate::config::{Config, DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS};
 use crate::error::Error;
 use crate::fee_estimator::{
@@ -98,10 +98,37 @@ fn mark_syncing(sync_state_tx: &watch::Sender<CbfSyncState>) {
 	}
 }
 
+/// Optional external fee estimation backend for the CBF chain source.
+///
+/// By default CBF derives fee rates from recent blocks' coinbase outputs.
+/// Setting an external source provides more accurate, per-target estimates
+/// from a mempool-aware server.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum CbfFeeSourceConfig {
+	/// Use an Esplora HTTP server for fee rate estimation.
+	Esplora(String),
+	/// Use an Electrum server for fee rate estimation.
+	Electrum(String),
+}
+
+/// Parameters of a custom signet, requiring [`Network::Signet`] to be configured.
+///
+/// [`Network::Signet`]: bitcoin::Network::Signet
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct CbfCustomSignet {
+	/// The 4-byte P2P network magic.
+	pub magic: Vec<u8>,
+	/// The target time between blocks in seconds.
+	pub pow_target_spacing_secs: u64,
+}
+
 /// Struct for holding cbf chain source
 pub struct CbfChainSource {
 	/// Trusted peer addresses for kyoto's `Builder::add_peers`.
 	trusted_peers: Vec<TrustedPeer>,
+	custom_signet: Option<CbfCustomSignet>,
 	/// Scripts tracked by LDK, onchain wallet's scripts are pulled from the onchain wallet
 	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
 	fee_source: FeeSource,
@@ -292,10 +319,20 @@ enum FeeSource {
 
 impl CbfChainSource {
 	pub(crate) fn new(
-		peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>, runtime: Arc<Runtime>,
+		peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>,
+		custom_signet: Option<CbfCustomSignet>, runtime: Arc<Runtime>,
 		fee_estimator: Arc<OnchainFeeEstimator>, kv_store: Arc<DynStore>, config: Arc<Config>,
 		logger: Arc<Logger>, node_metrics: Arc<PersistedNodeMetrics>,
 	) -> Result<Self, Error> {
+		if let Some(custom_signet) = &custom_signet {
+			if config.network != Network::Signet
+				|| custom_signet.magic.len() != 4
+				|| custom_signet.pow_target_spacing_secs == 0
+			{
+				log_error!(logger, "Invalid custom signet configuration");
+				return Err(Error::InvalidNetwork);
+			}
+		}
 		let trusted_peers: Vec<TrustedPeer> = peers
 			.iter()
 			.filter_map(|peer_str| {
@@ -322,6 +359,7 @@ impl CbfChainSource {
 			watch::channel(CbfSyncState::Active { applied_tip: None, synced_to_tip: false });
 		Ok(Self {
 			trusted_peers,
+			custom_signet,
 			fee_source,
 			registered_scripts,
 			cbf_runtime_status,
@@ -336,13 +374,18 @@ impl CbfChainSource {
 	}
 
 	fn build_kyoto(
-		trusted_peers: &[TrustedPeer], config: &Config, logger: &Logger,
-		chain_listener: &ChainListener,
+		trusted_peers: &[TrustedPeer], custom_signet: Option<&CbfCustomSignet>, config: &Config,
+		logger: &Logger, chain_listener: &ChainListener,
 	) -> (KyotoNode, Client) {
 		let mut kyoto_builder = KyotoBuilder::new(config.network);
 
-		let data_dir = std::path::PathBuf::from(&config.storage_dir_path).join("bip157_data");
-		kyoto_builder = kyoto_builder.data_dir(data_dir);
+		if let Some(custom_signet) = custom_signet {
+			let magic = <[u8; 4]>::try_from(custom_signet.magic.as_slice())
+				.expect("magic length is checked on construction");
+			kyoto_builder = kyoto_builder
+				.custom_magic(Magic::from_bytes(magic))
+				.pow_target_spacing(Duration::from_secs(custom_signet.pow_target_spacing_secs));
+		}
 
 		if !trusted_peers.is_empty() {
 			kyoto_builder = kyoto_builder.add_peers(trusted_peers.to_vec());
@@ -367,8 +410,13 @@ impl CbfChainSource {
 	}
 
 	pub(crate) fn start(&self, chain_listener: ChainListener) {
-		let (node, client) =
-			Self::build_kyoto(&self.trusted_peers, &self.config, &self.logger, &chain_listener);
+		let (node, client) = Self::build_kyoto(
+			&self.trusted_peers,
+			self.custom_signet.as_ref(),
+			&self.config,
+			&self.logger,
+			&chain_listener,
+		);
 		let Client { requester, info_rx, warn_rx, event_rx } = client;
 
 		{
@@ -407,6 +455,7 @@ impl CbfChainSource {
 		let restart_status = Arc::clone(&self.cbf_runtime_status);
 		let restart_logger = Arc::clone(&self.logger);
 		let restart_peers = self.trusted_peers.clone();
+		let restart_custom_signet = self.custom_signet.clone();
 		let restart_config = Arc::clone(&self.config);
 		let restart_listener = chain_listener;
 		let restart_registered_scripts = Arc::clone(&self.registered_scripts);
@@ -490,6 +539,7 @@ impl CbfChainSource {
 						backoff_ms = backoff_ms.saturating_mul(2);
 						let (new_node, new_client) = Self::build_kyoto(
 							&restart_peers,
+							restart_custom_signet.as_ref(),
 							&restart_config,
 							&restart_logger,
 							&restart_listener,

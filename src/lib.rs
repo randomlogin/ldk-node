@@ -133,7 +133,7 @@ use bitcoin::{Address, Amount, BlockHash, Network};
 pub use builder::{BuildError, Builder};
 use chain::ChainSource;
 #[cfg(feature = "chain-cbf")]
-pub use chain::CbfFeeSourceConfig;
+pub use chain::{CbfCustomSignet, CbfFeeSourceConfig};
 use config::{
 	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
 	LNURL_AUTH_TIMEOUT_SECS, NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL,

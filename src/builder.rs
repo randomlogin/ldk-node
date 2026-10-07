@@ -54,7 +54,7 @@ use vss_client::headers::VssHeaderProvider;
 
 use crate::chain::ChainSource;
 #[cfg(feature = "chain-cbf")]
-use crate::chain::CbfFeeSourceConfig;
+use crate::chain::{CbfCustomSignet, CbfFeeSourceConfig};
 #[cfg(feature = "chain-bitcoind")]
 use crate::config::BitcoindRestClientConfig;
 use crate::config::{
@@ -140,6 +140,7 @@ enum ChainDataSourceConfig {
 	Cbf {
 		peers: Vec<String>,
 		fee_source_config: Option<CbfFeeSourceConfig>,
+		custom_signet: Option<CbfCustomSignet>,
 	},
 }
 
@@ -444,12 +445,16 @@ impl NodeBuilder {
 	///
 	/// `fee_source_config` optionally delegates fee estimation to an Esplora or Electrum server;
 	/// if `None`, fee rates are derived from recent blocks.
+	///
+	/// `custom_signet` configures a custom signet, which requires the network to be set to
+	/// [`Network::Signet`]; the build fails otherwise.
 	#[cfg(feature = "chain-cbf")]
 	pub fn set_chain_source_cbf(
 		&mut self, peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>,
+		custom_signet: Option<CbfCustomSignet>,
 	) -> &mut Self {
 		self.chain_data_source_config =
-			Some(ChainDataSourceConfig::Cbf { peers, fee_source_config });
+			Some(ChainDataSourceConfig::Cbf { peers, fee_source_config, custom_signet });
 		self
 	}
 
@@ -1118,8 +1123,13 @@ impl Builder {
 	/// if `None`, fee rates are derived from recent blocks.
 	pub fn set_chain_source_cbf(
 		&self, peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>,
+		custom_signet: Option<CbfCustomSignet>,
 	) {
-		self.inner.write().expect("lock").set_chain_source_cbf(peers, fee_source_config);
+		self.inner.write().expect("lock").set_chain_source_cbf(
+			peers,
+			fee_source_config,
+			custom_signet,
+		);
 	}
 }
 
@@ -1686,9 +1696,10 @@ fn build_with_store_internal(
 			)
 		},
 		#[cfg(feature = "chain-cbf")]
-		Some(ChainDataSourceConfig::Cbf { peers, fee_source_config }) => ChainSource::new_cbf(
+		Some(ChainDataSourceConfig::Cbf { peers, fee_source_config, custom_signet }) => ChainSource::new_cbf(
 			peers.clone(),
 			fee_source_config.clone(),
+			custom_signet.clone(),
 			Arc::clone(&runtime),
 			Arc::clone(&fee_estimator),
 			Arc::clone(&tx_broadcaster),
