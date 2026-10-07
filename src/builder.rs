@@ -56,7 +56,7 @@ use vss_client::headers::VssHeaderProvider;
 
 use crate::chain::ChainSource;
 #[cfg(feature = "chain-cbf")]
-use crate::chain::{CbfFeeSourceConfig, CbfNetworkConfig};
+use crate::chain::{CbfCustomSignet, CbfFeeSourceConfig, CbfNetworkConfig};
 #[cfg(feature = "chain-bitcoind")]
 use crate::config::BitcoindRestClientConfig;
 use crate::config::{
@@ -145,6 +145,7 @@ enum ChainDataSourceConfig {
 	Cbf {
 		network_config: Option<CbfNetworkConfig>,
 		fee_source_config: Option<CbfFeeSourceConfig>,
+		custom_signet: Option<CbfCustomSignet>,
 	},
 }
 
@@ -455,13 +456,16 @@ impl NodeBuilder {
 	///
 	/// `fee_source_config` optionally delegates fee estimation to an Esplora or Electrum server;
 	/// if `None`, fee rates are derived from recent blocks.
+	///
+	/// `custom_signet` configures a custom signet, which requires the network to be set to
+	/// [`Network::Signet`]; the build fails otherwise.
 	#[cfg(feature = "chain-cbf")]
 	pub fn set_chain_source_cbf(
 		&mut self, network_config: Option<CbfNetworkConfig>,
-		fee_source_config: Option<CbfFeeSourceConfig>,
+		fee_source_config: Option<CbfFeeSourceConfig>, custom_signet: Option<CbfCustomSignet>,
 	) -> &mut Self {
 		self.chain_data_source_config =
-			Some(ChainDataSourceConfig::Cbf { network_config, fee_source_config });
+			Some(ChainDataSourceConfig::Cbf { network_config, fee_source_config, custom_signet });
 		self
 	}
 
@@ -1139,12 +1143,13 @@ impl Builder {
 	/// if `None`, fee rates are derived from recent blocks.
 	pub fn set_chain_source_cbf(
 		&self, network_config: Option<CbfNetworkConfig>,
-		fee_source_config: Option<CbfFeeSourceConfig>,
+		fee_source_config: Option<CbfFeeSourceConfig>, custom_signet: Option<CbfCustomSignet>,
 	) {
-		self.inner
-			.write()
-			.expect("lock")
-			.set_chain_source_cbf(network_config, fee_source_config);
+		self.inner.write().expect("lock").set_chain_source_cbf(
+			network_config,
+			fee_source_config,
+			custom_signet,
+		);
 	}
 }
 
@@ -1723,18 +1728,21 @@ fn build_with_store_internal(
 			)
 		},
 		#[cfg(feature = "chain-cbf")]
-		Some(ChainDataSourceConfig::Cbf { network_config, fee_source_config }) => ChainSource::new_cbf(
-			network_config.clone(),
-			fee_source_config.clone(),
-			Arc::clone(&runtime),
-			Arc::clone(&fee_estimator),
-			Arc::clone(&tx_broadcaster),
-			Arc::clone(&kv_store),
-			Arc::clone(&config),
-			Arc::clone(&logger),
-			Arc::clone(&node_metrics),
-		)
-		.map_err(|_| BuildError::ChainSourceSetupFailed)?,
+		Some(ChainDataSourceConfig::Cbf { network_config, fee_source_config, custom_signet }) => {
+			ChainSource::new_cbf(
+				network_config.clone(),
+				fee_source_config.clone(),
+				custom_signet.clone(),
+				Arc::clone(&runtime),
+				Arc::clone(&fee_estimator),
+				Arc::clone(&tx_broadcaster),
+				Arc::clone(&kv_store),
+				Arc::clone(&config),
+				Arc::clone(&logger),
+				Arc::clone(&node_metrics),
+			)
+			.map_err(|_| BuildError::ChainSourceSetupFailed)?
+		},
 		#[cfg(feature = "chain-bitcoind")]
 		Some(ChainDataSourceConfig::Bitcoind {
 			rpc_host,

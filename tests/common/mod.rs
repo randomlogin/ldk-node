@@ -809,7 +809,7 @@ pub(crate) fn configure_chain_source(
 				whitelist_only: true,
 				required_peers: 1,
 			};
-			builder.set_chain_source_cbf(Some(network_config), None);
+			builder.set_chain_source_cbf(Some(network_config), None, None);
 		},
 	}
 }

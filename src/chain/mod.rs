@@ -31,6 +31,8 @@ use crate::chain::bitcoind::{BitcoindChainSource, UtxoSourceClient};
 pub use crate::chain::cbf::CbfNetworkConfig;
 #[cfg(feature = "chain-cbf")]
 use crate::chain::cbf::CbfChainSource;
+#[cfg(feature = "chain-cbf")]
+pub use crate::chain::cbf::{CbfCustomSignet, CbfFeeSourceConfig};
 #[cfg(feature = "chain-electrum")]
 use crate::chain::electrum::ElectrumChainSource;
 #[cfg(feature = "chain-esplora")]
@@ -150,26 +152,6 @@ impl WalletSyncStatus {
 			}
 		}
 	}
-}
-
-/// Optional external fee estimation backend for the CBF chain source.
-///
-/// By default CBF derives fee rates from recent blocks' coinbase outputs.
-/// Setting an external source provides more accurate, per-target estimates
-/// from a mempool-aware server.
-///
-/// Each source is available only with its own chain source feature (`chain-esplora`,
-/// `chain-electrum`), so CBF can be built with either, both or neither.
-#[cfg(feature = "chain-cbf")]
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-pub enum CbfFeeSourceConfig {
-	/// Use an Esplora HTTP server for fee rate estimation.
-	#[cfg(feature = "chain-esplora")]
-	Esplora(String),
-	/// Use an Electrum server for fee rate estimation.
-	#[cfg(feature = "chain-electrum")]
-	Electrum(String),
 }
 
 pub(crate) struct ChainSource {
@@ -407,13 +389,15 @@ impl ChainSource {
 	#[cfg(feature = "chain-cbf")]
 	pub(crate) fn new_cbf(
 		network_config: Option<CbfNetworkConfig>, fee_source_config: Option<CbfFeeSourceConfig>,
-		runtime: Arc<Runtime>, fee_estimator: Arc<OnchainFeeEstimator>,
-		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
-		logger: Arc<Logger>, node_metrics: Arc<PersistedNodeMetrics>,
+		custom_signet: Option<CbfCustomSignet>, runtime: Arc<Runtime>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
+		node_metrics: Arc<PersistedNodeMetrics>,
 	) -> Result<(Self, Option<BlockLocator>), Error> {
 		let cbf_chain_source = CbfChainSource::new(
 			network_config.unwrap_or_default(),
 			fee_source_config,
+			custom_signet,
 			runtime,
 			Arc::clone(&fee_estimator),
 			Arc::clone(&kv_store),
