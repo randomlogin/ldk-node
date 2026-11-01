@@ -134,7 +134,7 @@ use bitcoin::{Address, Amount, BlockHash, Network};
 pub use builder::{BuildError, Builder};
 use chain::ChainSource;
 #[cfg(feature = "chain-cbf")]
-pub use chain::{CbfCustomSignet, CbfFeeSourceConfig, CbfNetworkConfig};
+pub use chain::{CbfCustomSignet, CbfFeeSourceConfig, CbfNetworkConfig, CbfStats};
 use config::{
 	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
 	LNURL_AUTH_TIMEOUT_SECS, NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL,
@@ -960,6 +960,15 @@ impl Node {
 
 		#[cfg(tokio_unstable)]
 		self.runtime.log_metrics();
+	}
+
+	/// Returns what the compact block filter chain source has done since the node started:
+	/// filters checked and matched, blocks fetched, and how many scripts are watched.
+	///
+	/// Returns `None` if the node uses another chain source.
+	#[cfg(feature = "chain-cbf")]
+	pub fn cbf_stats(&self) -> Option<CbfStats> {
+		self.chain_source.cbf_stats()
 	}
 
 	/// Returns the status of the [`Node`].

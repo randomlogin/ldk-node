@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -202,6 +203,46 @@ pub struct CbfCustomSignet {
 	pub pow_target_spacing_secs: u64,
 }
 
+/// A point-in-time copy of what the compact block filter chain source has done since the node
+/// started. The counts are not reset when the underlying kyoto node is restarted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct CbfStats {
+	/// Compact block filters received from peers and checked against the watched scripts.
+	pub filters_received: u64,
+	/// Filters that matched at least one watched script, so the full block was needed.
+	pub filters_matched: u64,
+	/// Blocks asked of peers for any reason: matched filters, fee estimation, or finding the
+	/// chain tip. A retried download counts again.
+	pub blocks_requested: u64,
+	/// Blocks that peers delivered, for any reason.
+	pub blocks_downloaded: u64,
+	/// The part of `blocks_downloaded` that was fetched because its filter matched.
+	pub matched_blocks_downloaded: u64,
+	/// Scripts of the on-chain wallet that the last received filter was checked against. It is
+	/// updated when a filter arrives, so it does not move while no filters are coming in.
+	pub wallet_scripts: u64,
+	/// Scripts registered by LDK, such as channel funding and counterparty outputs.
+	pub ldk_scripts: u64,
+}
+
+/// The counters behind [`CbfStats`], shared with the tasks that process kyoto's events.
+#[derive(Debug, Default)]
+pub(crate) struct CbfCounters {
+	filters_received: AtomicU64,
+	filters_matched: AtomicU64,
+	blocks_requested: AtomicU64,
+	blocks_downloaded: AtomicU64,
+	matched_blocks_downloaded: AtomicU64,
+	wallet_scripts: AtomicU64,
+}
+
+impl CbfCounters {
+	fn add(counter: &AtomicU64) {
+		counter.fetch_add(1, Ordering::Relaxed);
+	}
+}
+
 /// Struct for holding cbf chain source
 pub struct CbfChainSource {
 	/// Peer settings applied to every kyoto builder.
@@ -209,6 +250,8 @@ pub struct CbfChainSource {
 	custom_signet: Option<CbfCustomSignet>,
 	/// Scripts tracked by LDK, onchain wallet's scripts are pulled from the onchain wallet
 	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
+	/// Activity counters, kept here rather than in the kyoto node so they survive its restarts.
+	counters: Arc<CbfCounters>,
 	fee_source: FeeSource,
 	/// Tracks whether the kyoto node is running and holds the live requester.
 	cbf_runtime_status: Arc<Mutex<CbfRuntimeStatus>>,
@@ -443,6 +486,7 @@ impl CbfChainSource {
 			custom_signet,
 			fee_source,
 			registered_scripts,
+			counters: Arc::new(CbfCounters::default()),
 			cbf_runtime_status,
 			sync_state_tx,
 			runtime,
@@ -452,6 +496,20 @@ impl CbfChainSource {
 			node_metrics,
 			logger,
 		})
+	}
+
+	/// A snapshot of the activity counters.
+	pub(crate) fn stats(&self) -> CbfStats {
+		let counters = &self.counters;
+		CbfStats {
+			filters_received: counters.filters_received.load(Ordering::Relaxed),
+			filters_matched: counters.filters_matched.load(Ordering::Relaxed),
+			blocks_requested: counters.blocks_requested.load(Ordering::Relaxed),
+			blocks_downloaded: counters.blocks_downloaded.load(Ordering::Relaxed),
+			matched_blocks_downloaded: counters.matched_blocks_downloaded.load(Ordering::Relaxed),
+			wallet_scripts: counters.wallet_scripts.load(Ordering::Relaxed),
+			ldk_scripts: self.registered_scripts.lock().expect("lock").len() as u64,
+		}
 	}
 
 	fn build_kyoto(
@@ -519,7 +577,7 @@ impl CbfChainSource {
 		tokio::spawn(Self::process_warn_messages(warn_rx, Arc::clone(&self.logger)));
 		let node_handle = tokio::spawn(node.run());
 
-		let source = KyotoBlockSource(requester.clone());
+		let source = KyotoBlockSource(requester.clone(), Arc::clone(&self.counters));
 		let stable_tip_discovery = async {
 			loop {
 				match event_rx.recv().await {
@@ -643,6 +701,7 @@ impl CbfChainSource {
 		let restart_config = Arc::clone(&self.config);
 		let restart_listener = chain_listener;
 		let restart_registered_scripts = Arc::clone(&self.registered_scripts);
+		let restart_counters = Arc::clone(&self.counters);
 		let restart_cbf_runtime_status = Arc::clone(&self.cbf_runtime_status);
 		let restart_sync_state_tx = self.sync_state_tx.clone();
 
@@ -678,6 +737,7 @@ impl CbfChainSource {
 					Arc::clone(&restart_logger),
 					preprocessed_event_rx,
 					Arc::clone(&restart_registered_scripts),
+					Arc::clone(&restart_counters),
 					Arc::clone(&restart_cbf_runtime_status),
 					ops_tx.clone(),
 					restart_listener.onchain_wallet.clone(),
@@ -861,7 +921,7 @@ impl CbfChainSource {
 
 	async fn process_kyoto_events(
 		logger: Arc<Logger>, mut event_rx: mpsc::UnboundedReceiver<KyotoEvent>,
-		registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
+		registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>, counters: Arc<CbfCounters>,
 		cbf_runtime_status: Arc<Mutex<CbfRuntimeStatus>>, ops_tx: mpsc::UnboundedSender<ChainOp>,
 		onchain_wallet: std::sync::Weak<Wallet>, sync_state_tx: watch::Sender<CbfSyncState>,
 	) {
@@ -891,17 +951,25 @@ impl CbfChainSource {
 					//revealed scripts. We create all_scripts starting from onchain wallet's
 					//scripts and extend them with LDK's ones
 					let mut all_scripts = onchain_wallet.list_watched_scripts();
+					counters.wallet_scripts.store(all_scripts.len() as u64, Ordering::Relaxed);
 					all_scripts.extend(registered_scripts.lock().expect("lock").iter().cloned());
 
 					let block_hash = indexed_filter.block_hash();
 					let matched = indexed_filter.contains_any(all_scripts.iter());
+					CbfCounters::add(&counters.filters_received);
+					if matched {
+						CbfCounters::add(&counters.filters_matched);
+					}
 
 					let chop: ChainOp = if matched {
 						let mut attempt = 0;
 						let block = loop {
 							attempt += 1;
 							let handle = match requester.request_block(block_hash) {
-								Ok(handle) => handle,
+								Ok(handle) => {
+									CbfCounters::add(&counters.blocks_requested);
+									handle
+								},
 								Err(_) => {
 									log_error!(
 										logger,
@@ -929,7 +997,11 @@ impl CbfChainSource {
 							.and_then(|fetch| fetch.map_err(|e| format!("failed: {:?}", e)));
 
 							match fetched {
-								Ok(block) => break block,
+								Ok(block) => {
+									CbfCounters::add(&counters.blocks_downloaded);
+									CbfCounters::add(&counters.matched_blocks_downloaded);
+									break block;
+								},
 								Err(reason) if attempt < CBF_BLOCK_FETCH_RETRIES => {
 									log_debug!(
 										logger,
@@ -1247,6 +1319,7 @@ impl CbfChainSource {
 				}
 			}
 
+			CbfCounters::add(&self.counters.blocks_requested);
 			match tokio::time::timeout(
 				Duration::from_secs(CBF_BLOCK_FETCH_TIMEOUT_SECS),
 				requester.average_fee_rate(canonical_hash),
@@ -1254,6 +1327,7 @@ impl CbfChainSource {
 			.await
 			{
 				Ok(Ok(fee_rate)) => {
+					CbfCounters::add(&self.counters.blocks_downloaded);
 					window.insert(height, (canonical_hash, fee_rate));
 				},
 				Ok(Err(e)) => {
@@ -1283,7 +1357,7 @@ impl CbfChainSource {
 
 /// Exposes kyoto's [`KyotoRequester`] as a [`BlockSource`], so that the tip can be discovered with
 /// the same code path as for the Bitcoin Core sources.
-struct KyotoBlockSource(KyotoRequester);
+struct KyotoBlockSource(KyotoRequester, Arc<CbfCounters>);
 
 impl BlockSource for KyotoBlockSource {
 	fn get_header<'a>(
@@ -1323,11 +1397,13 @@ impl BlockSource for KyotoBlockSource {
 		&'a self, header_hash: &'a BlockHash,
 	) -> impl Future<Output = Result<BlockData, BlockSourceError>> + 'a {
 		async move {
+			CbfCounters::add(&self.1.blocks_requested);
 			let indexed_block = self
 				.0
 				.get_block(*header_hash)
 				.await
 				.map_err(|e| BlockSourceError::transient(format!("{:?}", e)))?;
+			CbfCounters::add(&self.1.blocks_downloaded);
 			Ok(BlockData::FullBlock(indexed_block.block))
 		}
 	}

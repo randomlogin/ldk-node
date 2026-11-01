@@ -32,7 +32,7 @@ pub use crate::chain::cbf::CbfNetworkConfig;
 #[cfg(feature = "chain-cbf")]
 use crate::chain::cbf::CbfChainSource;
 #[cfg(feature = "chain-cbf")]
-pub use crate::chain::cbf::{CbfCustomSignet, CbfFeeSourceConfig};
+pub use crate::chain::cbf::{CbfCustomSignet, CbfFeeSourceConfig, CbfStats};
 #[cfg(feature = "chain-electrum")]
 use crate::chain::electrum::ElectrumChainSource;
 #[cfg(feature = "chain-esplora")]
@@ -470,6 +470,15 @@ impl ChainSource {
 
 	pub(crate) fn registered_txids(&self) -> HashSet<Txid> {
 		self.registered_txids.lock().expect("lock").clone()
+	}
+
+	/// The activity counters of the compact block filter chain source, `None` for other sources.
+	#[cfg(feature = "chain-cbf")]
+	pub(crate) fn cbf_stats(&self) -> Option<CbfStats> {
+		match &self.kind {
+			ChainSourceKind::Cbf(cbf_chain_source) => Some(cbf_chain_source.stats()),
+			_ => None,
+		}
 	}
 
 	pub(crate) fn is_cbf(&self) -> bool {
